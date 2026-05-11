@@ -1,0 +1,33 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install StyLua
+        run: |
+          curl -L -o stylua.zip "https://github.com/JohnnyMorganz/StyLua/releases/download/v0.20.0/stylua-linux-x86_64.zip"
+          unzip stylua.zip
+          chmod +x stylua
+          sudo mv stylua /usr/local/bin/
+
+      - name: Install Selene
+        run: |
+          curl -L -o selene.zip "https://github.com/Kampfkarren/selene/releases/download/0.27.1/selene-0.27.1-linux.zip"
+          unzip selene.zip
+          chmod +x selene
+          sudo mv selene /usr/local/bin/
+
+      - name: StyLua check
+        run: stylua --check plugin/
+
+      - name: Selene
+        run: selene plugin/
