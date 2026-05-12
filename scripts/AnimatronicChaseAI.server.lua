@@ -1,5 +1,21 @@
--- Fair horror chase AI for an animatronic-style NPC.
--- Tweak the Difficulty attribute on this Script to Easy, Medium, or Hard.
+-- Animatronic chase AI for the Fazbear security map.
+--
+-- Drop this Script inside an NPC model that has a Humanoid and a
+-- HumanoidRootPart. Set the script's "Difficulty" attribute to
+-- "Easy" | "Medium" | "Hard" (defaults to Medium).
+--
+-- Optional: a child Folder named "PatrolPoints" containing BasePart
+-- waypoints. If present, the animatronic patrols between them; if
+-- absent, it wanders.
+--
+-- Detection feedback fires on ReplicatedStorage.PlayerDetectionChanged
+-- (RemoteEvent) -- payload (player, isDetected: boolean). The plugin's
+-- camera tablet can listen on this to flash an alert.
+--
+-- Design: a simple state machine. Sight is a forward cone with a
+-- raycast, hearing is proximity scaled by player speed. There is NO
+-- "audible through walls" or "wrong-path lottery" -- the AI either has
+-- a reason to come for you or it doesn't.
 
 local Players = game:GetService("Players")
 local PathfindingService = game:GetService("PathfindingService")
@@ -10,53 +26,48 @@ local DIFFICULTY = script:GetAttribute("Difficulty") or "Medium"
 
 local DIFFICULTIES = {
 	Easy = {
-		walkSpeed = 10,
-		chaseSpeed = 17,
-		seenSpeed = 18,
-		reactionMin = 0.42,
-		reactionMax = 0.6,
-		seenReactionMin = 0.26,
-		seenReactionMax = 0.42,
-		predictionError = 10,
-		badPathChance = 0.25,
-		badPathOffset = 14,
-		commitTime = 0.55,
-		overshootDistance = 12,
-		searchRadius = 24,
+		patrolSpeed = 8,
+		investigateSpeed = 13,
+		chaseSpeed = 16,
+		sightRange = 45,
+		sightFovDeg = 90,
+		hearingRange = 26,
+		hearingSpeedFloor = 10, -- player must move >= this fast to be heard
+		investigateTimeout = 5.5,
+		searchDuration = 3.5,
+		patrolDwellMin = 4.0,
+		patrolDwellMax = 7.0,
 	},
 	Medium = {
-		walkSpeed = 11,
-		chaseSpeed = 19,
-		seenSpeed = 21,
-		reactionMin = 0.28,
-		reactionMax = 0.48,
-		seenReactionMin = 0.18,
-		seenReactionMax = 0.32,
-		predictionError = 6,
-		badPathChance = 0.16,
-		badPathOffset = 10,
-		commitTime = 0.38,
-		overshootDistance = 9,
-		searchRadius = 18,
+		patrolSpeed = 9,
+		investigateSpeed = 15,
+		chaseSpeed = 18,
+		sightRange = 65,
+		sightFovDeg = 120,
+		hearingRange = 38,
+		hearingSpeedFloor = 6,
+		investigateTimeout = 4.5,
+		searchDuration = 3.0,
+		patrolDwellMin = 3.0,
+		patrolDwellMax = 5.5,
 	},
 	Hard = {
-		walkSpeed = 12,
+		patrolSpeed = 11,
+		investigateSpeed = 17,
 		chaseSpeed = 21,
-		seenSpeed = 23,
-		reactionMin = 0.2,
-		reactionMax = 0.34,
-		seenReactionMin = 0.12,
-		seenReactionMax = 0.24,
-		predictionError = 3.5,
-		badPathChance = 0.1,
-		badPathOffset = 7,
-		commitTime = 0.25,
-		overshootDistance = 6,
-		searchRadius = 14,
+		sightRange = 90,
+		sightFovDeg = 150,
+		hearingRange = 52,
+		hearingSpeedFloor = 3,
+		investigateTimeout = 3.5,
+		searchDuration = 2.5,
+		patrolDwellMin = 2.0,
+		patrolDwellMax = 4.0,
 	},
 }
 
 local CONFIG = DIFFICULTIES[DIFFICULTY] or DIFFICULTIES.Medium
+local SIGHT_FOV_HALF_COS = math.cos(math.rad(CONFIG.sightFovDeg) / 2)
 
 local detectionEvent = ReplicatedStorage:FindFirstChild("PlayerDetectionChanged")
 if not detectionEvent then
@@ -65,47 +76,31 @@ if not detectionEvent then
 	detectionEvent.Parent = ReplicatedStorage
 end
 
--- Core movement tuning.
-local SEARCH_DISTANCE = 260
-local GIVE_UP_AFTER_LOS_LOSS = 7
-local TARGET_REFRESH_INTERVAL = 0.2
-local PATH_REFRESH_INTERVAL = 0.55
-local WAYPOINT_REACHED_DISTANCE = 3.75
-local DESTINATION_REPATH_DISTANCE = 5
-local CLOSE_RANGE_DISTANCE = 10
-local PERSONAL_SPACE = 4.5
-
--- Horror/fairness tuning.
-local SHARP_TURN_DOT = 0.15
-local MIN_TURN_SPEED = 10
-local GLITCH_PAUSE_CHANCE = 0.06
-local GLITCH_PAUSE_MIN = 0.2
-local GLITCH_PAUSE_MAX = 0.55
-local GLITCH_CHECK_INTERVAL = 4
-local IDLE_WANDER_RADIUS = 22
-local STUCK_CHECK_INTERVAL = 0.8
-local STUCK_DISTANCE = 1.1
+-- Tuning constants the difficulty curves don't touch.
+local PERCEPTION_INTERVAL = 0.2
+local PATH_REFRESH_INTERVAL = 0.5
+local WAYPOINT_REACHED_DISTANCE = 4
+local DIRECT_MOVE_DISTANCE = 12
+local STUCK_CHECK_INTERVAL = 1.0
+local STUCK_DISTANCE = 1.5
+local EYE_HEIGHT = 2
 
 local character = script.Parent
 local humanoid = character:WaitForChild("Humanoid")
 local rootPart = character:WaitForChild("HumanoidRootPart")
 
-humanoid.WalkSpeed = CONFIG.walkSpeed
 humanoid.AutoRotate = true
 humanoid.PlatformStand = false
 humanoid.Sit = false
+humanoid.WalkSpeed = CONFIG.patrolSpeed
 
-if rootPart:IsA("BasePart") then
-	rootPart.Anchored = false
-end
-
-for _, descendant in ipairs(character:GetDescendants()) do
-	if descendant:IsA("BasePart") then
-		descendant.Anchored = false
-		descendant.CanCollide = false
-		descendant.Massless = descendant ~= rootPart
+for _, part in ipairs(character:GetDescendants()) do
+	if part:IsA("BasePart") then
+		part.Anchored = false
+		part.CanCollide = false
+		part.Massless = part ~= rootPart
 		pcall(function()
-			descendant:SetNetworkOwner(nil)
+			part:SetNetworkOwner(nil)
 		end)
 	end
 end
@@ -115,76 +110,236 @@ raycastParams.FilterDescendantsInstances = { character }
 raycastParams.FilterType = Enum.RaycastFilterType.Exclude
 raycastParams.IgnoreWater = true
 
--- Movement state.
-local currentPath = nil
-local blockedConnection = nil
-local waypoints = {}
-local waypointIndex = 0
-local currentDestination = nil
-local lastMoveCommand = nil
-local forceRepath = true
-local nextPathRefresh = 0
-
--- Detection and decision state.
-local targetRoot = nil
-local detectedPlayer = nil
-local lastDetectionState = false
-local lastKnownPosition = nil
-local lastSeenVelocity = Vector3.new(0, 0, 0)
-local previousTargetVelocity = Vector3.new(0, 0, 0)
-local pendingTargetVelocity = Vector3.new(0, 0, 0)
-local nextTargetMemoryRefresh = 0
-local hadLineOfSight = false
-local lastSeenAt = -math.huge
-local nextTargetRefresh = 0
-local nextDecisionAt = 0
-local committedUntil = 0
-local decisionDestination = nil
-
--- Search/idle state.
-local searchDestination = nil
-local nextSearchPickAt = 0
-local nextIdleWanderAt = 0
-local pauseUntil = 0
-local nextGlitchCheck = 0
-local stuckTimer = 0
-local lastStuckPosition = rootPart.Position
-
-local function randomRange(minValue, maxValue)
-	return minValue + math.random() * (maxValue - minValue)
+-- Optional patrol points: a child Folder of BaseParts.
+local patrolPoints = {}
+local patrolFolder = character:FindFirstChild("PatrolPoints")
+if patrolFolder then
+	for _, child in ipairs(patrolFolder:GetChildren()) do
+		if child:IsA("BasePart") then
+			table.insert(patrolPoints, child.Position)
+		end
+	end
 end
 
-local function flatten(vector)
-	return Vector3.new(vector.X, 0, vector.Z)
-end
+-- ------------------------------------------------------------------ --
+-- Perception
+-- ------------------------------------------------------------------ --
 
-local function randomHorizontalOffset(radius)
-	local angle = randomRange(0, math.pi * 2)
-	local distance = randomRange(radius * 0.35, radius)
-	return Vector3.new(math.cos(angle) * distance, 0, math.sin(angle) * distance)
+local function flatten(v)
+	return Vector3.new(v.X, 0, v.Z)
 end
 
 local function getLivingRoot(player)
-	local playerCharacter = player.Character
-	if not playerCharacter then
+	local char = player.Character
+	if not char then
 		return nil
 	end
-	local targetHumanoid = playerCharacter:FindFirstChildOfClass("Humanoid")
-	local targetRootPart = playerCharacter:FindFirstChild("HumanoidRootPart")
-	if not targetHumanoid or not targetRootPart or targetHumanoid.Health <= 0 then
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not hum or not root or hum.Health <= 0 then
 		return nil
 	end
-	return targetRootPart
+	return root
 end
 
-local function getPlayerFromRoot(root)
-	if root and root.Parent then
-		return Players:GetPlayerFromCharacter(root.Parent)
+local function hasLineOfSight(targetRoot)
+	local origin = rootPart.Position + Vector3.new(0, EYE_HEIGHT, 0)
+	local goal = targetRoot.Position + Vector3.new(0, EYE_HEIGHT, 0)
+	local hit = workspace:Raycast(origin, goal - origin, raycastParams)
+	if not hit then
+		return true
 	end
-	return nil
+	return hit.Instance:IsDescendantOf(targetRoot.Parent)
 end
 
-local function setPlayerDetected(player, isDetected)
+local function isInForwardCone(targetRoot)
+	local toTarget = flatten(targetRoot.Position - rootPart.Position)
+	if toTarget.Magnitude < 0.1 then
+		return true
+	end
+	local lookFlat = flatten(rootPart.CFrame.LookVector)
+	if lookFlat.Magnitude < 0.1 then
+		return true
+	end
+	return lookFlat.Unit:Dot(toTarget.Unit) >= SIGHT_FOV_HALF_COS
+end
+
+local function canSee(targetRoot)
+	local distance = (targetRoot.Position - rootPart.Position).Magnitude
+	if distance > CONFIG.sightRange then
+		return false
+	end
+	if not isInForwardCone(targetRoot) then
+		return false
+	end
+	return hasLineOfSight(targetRoot)
+end
+
+local function canHear(targetRoot)
+	local distance = (targetRoot.Position - rootPart.Position).Magnitude
+	if distance > CONFIG.hearingRange then
+		return false
+	end
+	local speed = flatten(targetRoot.AssemblyLinearVelocity).Magnitude
+	return speed >= CONFIG.hearingSpeedFloor
+end
+
+-- Returns (seen, heard) -- each is either nil or { player, root, position }.
+-- "seen" wins if both are populated for the same player.
+local function perceivePlayers()
+	local seen, heard = nil, nil
+	local seenDistance, heardDistance = math.huge, math.huge
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		local targetRoot = getLivingRoot(player)
+		if targetRoot then
+			local distance = (rootPart.Position - targetRoot.Position).Magnitude
+			if canSee(targetRoot) and distance < seenDistance then
+				seen = { player = player, root = targetRoot, position = targetRoot.Position }
+				seenDistance = distance
+			elseif canHear(targetRoot) and distance < heardDistance then
+				heard = { player = player, root = targetRoot, position = targetRoot.Position }
+				heardDistance = distance
+			end
+		end
+	end
+
+	return seen, heard
+end
+
+-- ------------------------------------------------------------------ --
+-- Movement (path follower)
+-- ------------------------------------------------------------------ --
+
+local currentPath = nil
+local waypoints = {}
+local waypointIndex = 0
+local currentDestination = nil
+local nextPathRefresh = 0
+local lastMoveCommand = nil
+local blockedConnection = nil
+
+local function clearPath()
+	if blockedConnection then
+		blockedConnection:Disconnect()
+		blockedConnection = nil
+	end
+	currentPath = nil
+	waypoints = {}
+	waypointIndex = 0
+	lastMoveCommand = nil
+end
+
+local function commandMove(position)
+	-- Dedup against the last issued MoveTo target so we don't thrash the
+	-- humanoid when the destination only drifts by sub-stud amounts.
+	if lastMoveCommand and (lastMoveCommand - position).Magnitude < 0.6 then
+		return
+	end
+	lastMoveCommand = position
+	humanoid:MoveTo(position)
+end
+
+local function followCurrentWaypoint()
+	local wp = waypoints[waypointIndex]
+	if not wp then
+		return
+	end
+	if wp.Action == Enum.PathWaypointAction.Jump then
+		humanoid.Jump = true
+	end
+	commandMove(wp.Position)
+end
+
+local function computePath(destination)
+	clearPath()
+	currentDestination = destination
+	nextPathRefresh = os.clock() + PATH_REFRESH_INTERVAL
+
+	local path = PathfindingService:CreatePath({
+		AgentRadius = 2,
+		AgentHeight = 5,
+		AgentCanJump = false,
+		WaypointSpacing = 4,
+	})
+
+	local ok = pcall(function()
+		path:ComputeAsync(rootPart.Position, destination)
+	end)
+
+	if not ok or path.Status ~= Enum.PathStatus.Success then
+		-- Fall back to a direct move so the AI keeps making progress even
+		-- when the navmesh can't find a route (e.g. open arena).
+		commandMove(destination)
+		return
+	end
+
+	currentPath = path
+	waypoints = path:GetWaypoints()
+	waypointIndex = math.min(2, #waypoints)
+
+	blockedConnection = path.Blocked:Connect(function(blockedIndex)
+		if blockedIndex >= waypointIndex then
+			nextPathRefresh = 0
+		end
+	end)
+
+	followCurrentWaypoint()
+end
+
+local function moveDirect(destination)
+	-- Bypass pathfinding for short-range pursuit where the cost of a path
+	-- query outweighs its benefit, and where pathfinding's lag tends to
+	-- visibly let the player slip away.
+	if blockedConnection then
+		blockedConnection:Disconnect()
+		blockedConnection = nil
+	end
+	currentPath = nil
+	waypoints = {}
+	waypointIndex = 0
+	currentDestination = destination
+	commandMove(destination)
+end
+
+local function pathTowards(destination)
+	local now = os.clock()
+	local destinationMoved = not currentDestination
+		or (destination - currentDestination).Magnitude >= 6
+	if destinationMoved or now >= nextPathRefresh or not currentPath then
+		computePath(destination)
+	end
+end
+
+local function advanceWaypointIfNeeded()
+	local wp = waypoints[waypointIndex]
+	if not wp then
+		return
+	end
+	if (rootPart.Position - wp.Position).Magnitude <= WAYPOINT_REACHED_DISTANCE then
+		waypointIndex += 1
+		if waypointIndex > #waypoints then
+			nextPathRefresh = 0
+		else
+			followCurrentWaypoint()
+		end
+	end
+end
+
+humanoid.MoveToFinished:Connect(function(reached)
+	if not reached then
+		nextPathRefresh = 0
+	end
+end)
+
+-- ------------------------------------------------------------------ --
+-- Detection event
+-- ------------------------------------------------------------------ --
+
+local detectedPlayer = nil
+local lastDetectionState = false
+
+local function setDetected(player, isDetected)
 	if player ~= detectedPlayer then
 		if detectedPlayer and lastDetectionState then
 			detectionEvent:FireClient(detectedPlayer, false)
@@ -198,310 +353,137 @@ local function setPlayerDetected(player, isDetected)
 	end
 end
 
-local function isTargetValid(root)
-	if not root or not root.Parent then
-		return false
-	end
-	local targetHumanoid = root.Parent:FindFirstChildOfClass("Humanoid")
-	return targetHumanoid and targetHumanoid.Health > 0
-end
+-- ------------------------------------------------------------------ --
+-- State machine
+-- ------------------------------------------------------------------ --
 
-local function hasLineOfSight(root)
-	local origin = rootPart.Position + Vector3.new(0, 2, 0)
-	local destination = root.Position + Vector3.new(0, 2, 0)
-	local result = workspace:Raycast(origin, destination - origin, raycastParams)
-	if not result then
-		return true
-	end
-	return result.Instance:IsDescendantOf(root.Parent)
-end
+local State = {
+	PATROL = "PATROL",
+	INVESTIGATE = "INVESTIGATE",
+	CHASE = "CHASE",
+	SEARCH = "SEARCH",
+}
 
-local function chooseTarget()
-	local bestVisibleRoot = nil
-	local bestVisibleDistance = SEARCH_DISTANCE
-	local bestAudibleRoot = nil
-	local bestAudibleDistance = SEARCH_DISTANCE
+local state = State.PATROL
+local stateEnteredAt = 0
+local targetPlayer = nil
+local targetRoot = nil
+local lastKnownPosition = nil
+local patrolDestination = nil
+local nextPatrolPickAt = 0
 
-	for _, player in ipairs(Players:GetPlayers()) do
-		local playerRoot = getLivingRoot(player)
-		if playerRoot then
-			local distance = (rootPart.Position - playerRoot.Position).Magnitude
-			if distance <= SEARCH_DISTANCE then
-				if hasLineOfSight(playerRoot) and distance < bestVisibleDistance then
-					bestVisibleRoot = playerRoot
-					bestVisibleDistance = distance
-				elseif distance < bestAudibleDistance then
-					bestAudibleRoot = playerRoot
-					bestAudibleDistance = distance
-				end
+local function pickPatrolDestination()
+	if #patrolPoints > 0 then
+		-- Avoid picking the patrol point we're standing on if there are
+		-- alternatives, so the NPC actually moves.
+		local candidates = {}
+		for _, position in ipairs(patrolPoints) do
+			if (position - rootPart.Position).Magnitude > WAYPOINT_REACHED_DISTANCE then
+				table.insert(candidates, position)
 			end
 		end
+		local pool = #candidates > 0 and candidates or patrolPoints
+		return pool[math.random(1, #pool)]
 	end
 
-	return bestVisibleRoot or bestAudibleRoot
+	local angle = math.random() * math.pi * 2
+	local distance = 12 + math.random() * 18
+	return rootPart.Position
+		+ Vector3.new(math.cos(angle) * distance, 0, math.sin(angle) * distance)
 end
 
-local function clearPath()
-	if blockedConnection then
-		blockedConnection:Disconnect()
-		blockedConnection = nil
-	end
-	currentPath = nil
-	waypoints = {}
-	waypointIndex = 0
-	-- Drop the dedup memory too, otherwise the next commandMove() right after
-	-- a pause or repath can be silently skipped because it looks 'close enough'
-	-- to whatever we'd commanded before clearing the path.
-	lastMoveCommand = nil
-end
-
-local function commandMove(position)
-	if lastMoveCommand and (lastMoveCommand - position).Magnitude < 0.4 then
+local function setState(newState, now)
+	if newState == state then
 		return
 	end
-	lastMoveCommand = position
-	humanoid:MoveTo(position)
-end
-
-local function followCurrentWaypoint()
-	local waypoint = waypoints[waypointIndex]
-	if not waypoint then
-		return
-	end
-	if waypoint.Action == Enum.PathWaypointAction.Jump then
-		humanoid.Jump = true
-	end
-	commandMove(waypoint.Position)
-end
-
-local function computePath(destination)
+	state = newState
+	stateEnteredAt = now
 	clearPath()
-	currentDestination = destination
-	nextPathRefresh = os.clock() + PATH_REFRESH_INTERVAL
-	forceRepath = false
 
-	local path = PathfindingService:CreatePath({
-		AgentRadius = 2,
-		AgentHeight = 6,
-		AgentCanJump = false,
-		WaypointSpacing = 4,
-	})
-
-	local success = pcall(function()
-		path:ComputeAsync(rootPart.Position, destination)
-	end)
-
-	if not success or path.Status ~= Enum.PathStatus.Success then
-		commandMove(destination)
-		return
-	end
-
-	currentPath = path
-	waypoints = path:GetWaypoints()
-	waypointIndex = math.min(2, #waypoints)
-
-	blockedConnection = path.Blocked:Connect(function(blockedWaypointIndex)
-		if blockedWaypointIndex >= waypointIndex then
-			forceRepath = true
-		end
-	end)
-
-	followCurrentWaypoint()
-end
-
-local function setDestination(destination, canMoveDirectly)
-	if canMoveDirectly then
-		clearPath()
-		currentDestination = destination
-		commandMove(destination)
-		return
-	end
-
-	local now = os.clock()
-	local destinationMoved = not currentDestination
-		or (destination - currentDestination).Magnitude >= DESTINATION_REPATH_DISTANCE
-
-	if forceRepath or destinationMoved or now >= nextPathRefresh or not currentPath then
-		computePath(destination)
+	if newState == State.PATROL then
+		humanoid.WalkSpeed = CONFIG.patrolSpeed
+		patrolDestination = nil
+		setDetected(nil, false)
+	elseif newState == State.INVESTIGATE then
+		humanoid.WalkSpeed = CONFIG.investigateSpeed
+		setDetected(targetPlayer, false)
+	elseif newState == State.CHASE then
+		humanoid.WalkSpeed = CONFIG.chaseSpeed
+		setDetected(targetPlayer, true)
+	elseif newState == State.SEARCH then
+		humanoid.WalkSpeed = CONFIG.investigateSpeed
+		setDetected(targetPlayer, false)
 	end
 end
 
-local function advanceWaypointIfNeeded()
-	local waypoint = waypoints[waypointIndex]
-	if not waypoint then
-		return
-	end
-	if (rootPart.Position - waypoint.Position).Magnitude <= WAYPOINT_REACHED_DISTANCE then
-		waypointIndex += 1
-		if waypointIndex > #waypoints then
-			forceRepath = true
-		else
-			followCurrentWaypoint()
-		end
-	end
-end
-
-local function pickSearchDestination(center)
-	searchDestination = center + randomHorizontalOffset(CONFIG.searchRadius)
-	nextSearchPickAt = os.clock() + randomRange(1.0, 1.8)
-	return searchDestination
-end
-
-local function buildImperfectDestination(canSeeTarget, now)
-	local basePosition
-
-	if canSeeTarget then
-		local targetPosition = targetRoot.Position
-		local targetVelocity = flatten(targetRoot.AssemblyLinearVelocity)
-		local distanceToTarget = (rootPart.Position - targetPosition).Magnitude
-
-		basePosition = targetPosition + targetVelocity * randomRange(0.08, 0.22)
-
-		-- FIX: Stop short of the player rather than overshooting through them.
-		-- The direction from the target back toward the NPC is used so the NPC
-		-- aims for a point just in front of the player, not past them.
-		if distanceToTarget < CLOSE_RANGE_DISTANCE then
-			local towardNpc = flatten(rootPart.Position - targetPosition)
-			if towardNpc.Magnitude > 0.1 then
-				basePosition += towardNpc.Unit * PERSONAL_SPACE
-			end
-		end
-
-		local previousFlatVelocity = flatten(previousTargetVelocity)
-		if
-			targetVelocity.Magnitude >= MIN_TURN_SPEED
-			and previousFlatVelocity.Magnitude >= MIN_TURN_SPEED
-		then
-			local turnDot = targetVelocity.Unit:Dot(previousFlatVelocity.Unit)
-			if turnDot < SHARP_TURN_DOT then
-				committedUntil = now + CONFIG.commitTime
-				basePosition = targetPosition + previousFlatVelocity.Unit * CONFIG.overshootDistance
-			end
-		end
-	elseif lastKnownPosition then
-		basePosition = lastKnownPosition
-		if lastSeenVelocity.Magnitude > 1 then
-			basePosition += lastSeenVelocity.Unit * randomRange(
-				CONFIG.overshootDistance * 0.35,
-				CONFIG.overshootDistance
-			)
-		end
-	else
-		basePosition = rootPart.Position
-	end
-
-	local errorRadius = CONFIG.predictionError
-	if not canSeeTarget then
-		errorRadius *= 1.35
-	end
-
-	local destination = basePosition + randomHorizontalOffset(errorRadius)
-	if math.random() < CONFIG.badPathChance then
-		destination += randomHorizontalOffset(CONFIG.badPathOffset)
-	end
-
-	return destination
-end
-
-local function resetTargetMemory()
-	previousTargetVelocity = Vector3.new(0, 0, 0)
-	pendingTargetVelocity = Vector3.new(0, 0, 0)
-	nextTargetMemoryRefresh = 0
-	lastKnownPosition = nil
-	lastSeenVelocity = Vector3.new(0, 0, 0)
-	lastSeenAt = -math.huge
-end
-
-local function updateTargetMemory(canSeeTarget, now)
-	if not isTargetValid(targetRoot) then
-		return
-	end
-
-	local currentPosition = targetRoot.Position
-	local currentVelocity = flatten(targetRoot.AssemblyLinearVelocity)
-
-	-- Snapshot the velocity on a fixed cadence so `previousTargetVelocity` is a
-	-- real ~TARGET_REFRESH_INTERVAL-old sample. The prior implementation divided
-	-- a one-frame displacement by TARGET_REFRESH_INTERVAL, producing a magnitude
-	-- roughly an order of magnitude too small. As a result the sharp-turn check
-	-- in buildImperfectDestination (magnitudes >= MIN_TURN_SPEED) never fired,
-	-- and the animatronic would just trundle through every juke.
-	if now >= nextTargetMemoryRefresh then
-		previousTargetVelocity = pendingTargetVelocity
-		pendingTargetVelocity = currentVelocity
-		nextTargetMemoryRefresh = now + TARGET_REFRESH_INTERVAL
-	end
-
-	if canSeeTarget then
-		lastKnownPosition = currentPosition
-		lastSeenVelocity = currentVelocity
-		lastSeenAt = now
-	elseif not lastKnownPosition then
-		-- Initial no-LOS awareness is intentionally vague, like hearing movement nearby.
-		lastKnownPosition = currentPosition + randomHorizontalOffset(CONFIG.searchRadius)
-		lastSeenVelocity = Vector3.new(0, 0, 0)
-		lastSeenAt = now - 1
-	end
-end
-
-local function updateDecision(canSeeTarget, now)
-	if now < committedUntil then
-		return
-	end
-
-	local reactionMin = canSeeTarget and CONFIG.seenReactionMin or CONFIG.reactionMin
-	local reactionMax = canSeeTarget and CONFIG.seenReactionMax or CONFIG.reactionMax
-
-	if now >= nextDecisionAt then
-		decisionDestination = buildImperfectDestination(canSeeTarget, now)
-		nextDecisionAt = now + randomRange(reactionMin, reactionMax)
-	end
-end
-
--- FIX: handleSearch now routes through updateDecision so reaction delays apply
--- during search, and correctly returns whether the search is still active.
-local function handleSearch(now)
-	if not lastKnownPosition or now - lastSeenAt > GIVE_UP_AFTER_LOS_LOSS then
-		lastKnownPosition = nil
-		searchDestination = nil
-		-- FIX: Reset speed to walk when giving up the chase entirely.
-		humanoid.WalkSpeed = CONFIG.walkSpeed
-		return false
-	end
-
-	-- Refresh the search anchor point periodically or when we reach it.
+local function updatePatrol(now)
 	if
-		not searchDestination
-		or now >= nextSearchPickAt
-		or (rootPart.Position - searchDestination).Magnitude <= WAYPOINT_REACHED_DISTANCE
+		not patrolDestination
+		or now >= nextPatrolPickAt
+		or (rootPart.Position - patrolDestination).Magnitude <= WAYPOINT_REACHED_DISTANCE
 	then
-		searchDestination = pickSearchDestination(lastKnownPosition)
+		patrolDestination = pickPatrolDestination()
+		nextPatrolPickAt = now
+			+ CONFIG.patrolDwellMin
+			+ math.random() * (CONFIG.patrolDwellMax - CONFIG.patrolDwellMin)
 	end
-
-	-- Route through updateDecision so reaction time applies during search too.
-	if now >= nextDecisionAt then
-		decisionDestination = searchDestination
-		local reactionMin = CONFIG.reactionMin
-		local reactionMax = CONFIG.reactionMax
-		nextDecisionAt = now + randomRange(reactionMin, reactionMax)
-	end
-
-	return true
+	pathTowards(patrolDestination)
 end
 
-local function handleIdle(now)
-	humanoid.WalkSpeed = CONFIG.walkSpeed
-	if now >= nextIdleWanderAt then
-		decisionDestination = rootPart.Position + randomHorizontalOffset(IDLE_WANDER_RADIUS)
-		nextIdleWanderAt = now + randomRange(2.5, 4.5)
+local function updateInvestigate(now)
+	if not lastKnownPosition then
+		setState(State.PATROL, now)
+		return
+	end
+
+	if (rootPart.Position - lastKnownPosition).Magnitude <= WAYPOINT_REACHED_DISTANCE then
+		setState(State.SEARCH, now)
+		return
+	end
+
+	if now - stateEnteredAt > CONFIG.investigateTimeout then
+		lastKnownPosition = nil
+		setState(State.PATROL, now)
+		return
+	end
+
+	pathTowards(lastKnownPosition)
+end
+
+local function updateChase(_now)
+	if not targetRoot or not targetRoot.Parent then
+		return
+	end
+	local distance = (rootPart.Position - targetRoot.Position).Magnitude
+	if distance <= DIRECT_MOVE_DISTANCE and hasLineOfSight(targetRoot) then
+		moveDirect(targetRoot.Position)
+	else
+		pathTowards(targetRoot.Position)
 	end
 end
 
-humanoid.MoveToFinished:Connect(function(reached)
-	if not reached then
-		forceRepath = true
+local function updateSearch(now)
+	if now - stateEnteredAt > CONFIG.searchDuration then
+		lastKnownPosition = nil
+		setState(State.PATROL, now)
+		return
 	end
-end)
+	if lastKnownPosition then
+		-- Pace a small circle around the last-known spot so the NPC isn't
+		-- frozen during the search window; reads as "looking around".
+		local angle = (now - stateEnteredAt) * 1.4
+		local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * 4
+		moveDirect(lastKnownPosition + offset)
+	end
+end
+
+-- ------------------------------------------------------------------ --
+-- Heartbeat
+-- ------------------------------------------------------------------ --
+
+local nextPerceptionAt = 0
+local stuckTimer = 0
+local lastStuckPosition = rootPart.Position
 
 RunService.Heartbeat:Connect(function(deltaTime)
 	if humanoid.Health <= 0 then
@@ -511,108 +493,64 @@ RunService.Heartbeat:Connect(function(deltaTime)
 
 	local now = os.clock()
 
-	if now >= nextTargetRefresh or not isTargetValid(targetRoot) then
-		local newTarget = chooseTarget()
-		if newTarget ~= targetRoot then
-			-- Wipe stale memory; otherwise the AI inherits the previous victim's
-			-- last-known position and velocity when switching targets.
-			resetTargetMemory()
-		end
-		targetRoot = newTarget
-		if not targetRoot then
-			setPlayerDetected(nil, false)
-		end
-		nextTargetRefresh = now + TARGET_REFRESH_INTERVAL
-	end
+	if now >= nextPerceptionAt then
+		nextPerceptionAt = now + PERCEPTION_INTERVAL
+		local seen, heard = perceivePlayers()
 
-	local canSeeTarget = isTargetValid(targetRoot) and hasLineOfSight(targetRoot)
-	local isActivelyHunting = canSeeTarget
-		or (lastKnownPosition and now - lastSeenAt <= GIVE_UP_AFTER_LOS_LOSS)
-
-	setPlayerDetected(getPlayerFromRoot(targetRoot), isActivelyHunting)
-
-	if canSeeTarget ~= hadLineOfSight then
-		forceRepath = true
-		hadLineOfSight = canSeeTarget
-	end
-
-	-- The stop command is issued exactly once on pause entry below. Re-issuing
-	-- humanoid:MoveTo every frame cancels the previous request, fires
-	-- MoveToFinished(reached=false) on a loop, and that handler sets
-	-- forceRepath=true continuously -- which thrashes the pathfinder the moment
-	-- the pause ends.
-	if now < pauseUntil then
-		return
-	end
-
-	if now >= nextGlitchCheck then
-		nextGlitchCheck = now + GLITCH_CHECK_INTERVAL
-		if isTargetValid(targetRoot) and math.random() < GLITCH_PAUSE_CHANCE then
-			pauseUntil = now + randomRange(GLITCH_PAUSE_MIN, GLITCH_PAUSE_MAX)
-			clearPath()
-			humanoid:MoveTo(rootPart.Position)
-			return
-		end
-	end
-
-	if isTargetValid(targetRoot) then
-		updateTargetMemory(canSeeTarget, now)
-
-		-- FIX: Set speed before deciding destination so the correct speed is
-		-- always active regardless of which branch runs below.
-		if canSeeTarget then
-			humanoid.WalkSpeed = CONFIG.seenSpeed
+		if seen then
+			targetPlayer = seen.player
+			targetRoot = seen.root
+			lastKnownPosition = seen.position
+			setState(State.CHASE, now)
 		else
-			humanoid.WalkSpeed = CONFIG.chaseSpeed
-		end
+			if heard then
+				targetPlayer = heard.player
+				lastKnownPosition = heard.position
+			end
+			-- targetRoot is the live HumanoidRootPart and is only meaningful
+			-- while we have visual contact; clear it as soon as we lose sight.
+			targetRoot = nil
 
-		if canSeeTarget then
-			updateDecision(canSeeTarget, now)
-		else
-			-- handleSearch returns false when the NPC gives up; in that case
-			-- fall through to idle so it doesn't freeze in place.
-			if not handleSearch(now) then
-				handleIdle(now)
+			if state == State.CHASE then
+				-- Lost sight: drop into INVESTIGATE on the last-known position
+				-- (refreshed above if we also have an audible cue this tick).
+				setState(State.INVESTIGATE, now)
+			elseif heard and (state == State.PATROL or state == State.SEARCH) then
+				setState(State.INVESTIGATE, now)
+			elseif heard and state == State.INVESTIGATE then
+				-- Ongoing noise refreshes the investigate window so a player
+				-- who keeps sprinting can't outlast the timeout.
+				stateEnteredAt = now
 			end
 		end
+	end
+
+	if state == State.CHASE then
+		updateChase(now)
+	elseif state == State.INVESTIGATE then
+		updateInvestigate(now)
+	elseif state == State.SEARCH then
+		updateSearch(now)
 	else
-		setPlayerDetected(nil, false)
-		handleIdle(now)
+		updatePatrol(now)
 	end
 
 	advanceWaypointIfNeeded()
 
-	-- Stuck detection.
 	stuckTimer += deltaTime
 	if stuckTimer >= STUCK_CHECK_INTERVAL then
 		local moved = (rootPart.Position - lastStuckPosition).Magnitude
-		if
-			moved < STUCK_DISTANCE
-			and decisionDestination
-			and (rootPart.Position - decisionDestination).Magnitude > WAYPOINT_REACHED_DISTANCE
-		then
+		if moved < STUCK_DISTANCE and currentDestination then
+			if state == State.PATROL then
+				-- The current patrol target is probably unreachable; pick
+				-- another one rather than grinding into a wall.
+				patrolDestination = pickPatrolDestination()
+				nextPatrolPickAt = now + CONFIG.patrolDwellMin
+			end
 			clearPath()
-			forceRepath = true
-			-- Route the nudge through decisionDestination instead of issuing it
-			-- directly with commandMove. The unconditional `setDestination` block
-			-- below would otherwise re-path to the player and clobber the nudge
-			-- the same frame. Briefly gate the decision/search/idle updaters so
-			-- the next iteration doesn't immediately overwrite it either.
-			local nudge = rootPart.Position + randomHorizontalOffset(CONFIG.badPathOffset)
-			decisionDestination = nudge
-			local nudgeUntil = now + 0.5
-			committedUntil = math.max(committedUntil, nudgeUntil)
-			nextDecisionAt = math.max(nextDecisionAt, nudgeUntil)
-			nextIdleWanderAt = math.max(nextIdleWanderAt, nudgeUntil)
-			humanoid:ChangeState(Enum.HumanoidStateType.Running)
+			nextPathRefresh = 0
 		end
-		lastStuckPosition = rootPart.Position
 		stuckTimer = 0
-	end
-
-	if decisionDestination then
-		local directMove = canSeeTarget
-			and (rootPart.Position - decisionDestination).Magnitude <= CLOSE_RANGE_DISTANCE
-		setDestination(decisionDestination, directMove)
+		lastStuckPosition = rootPart.Position
 	end
 end)
