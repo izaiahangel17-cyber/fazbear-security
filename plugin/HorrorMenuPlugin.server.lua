@@ -2261,6 +2261,7 @@ local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TeleportService = game:GetService("TeleportService")
+local TextService = game:GetService("TextService")
 
 local pkg = ReplicatedStorage:WaitForChild("HorrorMenu")
 local Remotes = pkg:WaitForChild("Remotes")
@@ -2587,6 +2588,27 @@ SetLobbyType.OnServerEvent:Connect(function(player, isPublic)
 	broadcastParty(party)
 end)
 
+-- Roblox requires every player-authored string we display to other players to
+-- pass through TextService.  We filter once on the server and broadcast the
+-- broadcast-safe filtered version to every party member.
+local function filterChatForBroadcast(text: string, fromUserId: number): string?
+	local okFilter, filterResult = pcall(function()
+		return TextService:FilterStringAsync(text, fromUserId, Enum.TextFilterContext.PublicChat)
+	end)
+	if not okFilter then
+		warn("[HorrorMenu] FilterStringAsync failed:", filterResult)
+		return nil
+	end
+	local okText, filtered = pcall(function()
+		return filterResult:GetNonChatStringForBroadcastAsync()
+	end)
+	if not okText then
+		warn("[HorrorMenu] GetNonChatStringForBroadcastAsync failed:", filtered)
+		return nil
+	end
+	return filtered
+end
+
 SendChat.OnServerEvent:Connect(function(player, textAny)
 	local party = partyOf(player)
 	if not party then
@@ -2596,10 +2618,15 @@ SendChat.OnServerEvent:Connect(function(player, textAny)
 	if not text then
 		return
 	end
+	local filtered = filterChatForBroadcast(text, player.UserId)
+	if not filtered then
+		Toast:FireClient(player, "Chat", "Message could not be sent.")
+		return
+	end
 	local entry = {
 		id = player.UserId,
 		name = player.DisplayName,
-		text = text,
+		text = filtered,
 		t = os.time(),
 	}
 	table.insert(party.chat, entry)
@@ -3338,9 +3365,8 @@ end
 -- Toggle button wiring
 for _, t in ipairs(SettingsBody:GetDescendants()) do
 	if t:GetAttribute("HMToggle") and t:IsA("GuiButton") then
-		local row = t.Parent
+		local key = t:GetAttribute("HMToggle")
 		t.MouseButton1Click:Connect(function()
-			local key = row:GetAttribute("HMToggle")
 			setToggle(key, not Settings[key])
 		end)
 	end
