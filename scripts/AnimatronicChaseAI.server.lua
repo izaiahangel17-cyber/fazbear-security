@@ -131,8 +131,9 @@ local detectedPlayer = nil
 local lastDetectionState = false
 local lastKnownPosition = nil
 local lastSeenVelocity = Vector3.new(0, 0, 0)
-local previousTargetPosition = nil
 local previousTargetVelocity = Vector3.new(0, 0, 0)
+local pendingTargetVelocity = Vector3.new(0, 0, 0)
+local nextTargetMemoryRefresh = 0
 local hadLineOfSight = false
 local lastSeenAt = -math.huge
 local nextTargetRefresh = 0
@@ -248,6 +249,10 @@ local function clearPath()
 	currentPath = nil
 	waypoints = {}
 	waypointIndex = 0
+	-- Drop the dedup memory too, otherwise the next commandMove() right after
+	-- a pause or repath can be silently skipped because it looks 'close enough'
+	-- to whatever we'd commanded before clearing the path.
+	lastMoveCommand = nil
 end
 
 local function commandMove(position)
@@ -398,23 +403,38 @@ local function buildImperfectDestination(canSeeTarget, now)
 	return destination
 end
 
+local function resetTargetMemory()
+	previousTargetVelocity = Vector3.new(0, 0, 0)
+	pendingTargetVelocity = Vector3.new(0, 0, 0)
+	nextTargetMemoryRefresh = 0
+	lastKnownPosition = nil
+	lastSeenVelocity = Vector3.new(0, 0, 0)
+	lastSeenAt = -math.huge
+end
+
 local function updateTargetMemory(canSeeTarget, now)
 	if not isTargetValid(targetRoot) then
 		return
 	end
 
 	local currentPosition = targetRoot.Position
+	local currentVelocity = flatten(targetRoot.AssemblyLinearVelocity)
 
-	if previousTargetPosition then
-		previousTargetVelocity = flatten(
-			(currentPosition - previousTargetPosition) / math.max(TARGET_REFRESH_INTERVAL, 0.01)
-		)
+	-- Snapshot the velocity on a fixed cadence so `previousTargetVelocity` is a
+	-- real ~TARGET_REFRESH_INTERVAL-old sample. The prior implementation divided
+	-- a one-frame displacement by TARGET_REFRESH_INTERVAL, producing a magnitude
+	-- roughly an order of magnitude too small. As a result the sharp-turn check
+	-- in buildImperfectDestination (magnitudes >= MIN_TURN_SPEED) never fired,
+	-- and the animatronic would just trundle through every juke.
+	if now >= nextTargetMemoryRefresh then
+		previousTargetVelocity = pendingTargetVelocity
+		pendingTargetVelocity = currentVelocity
+		nextTargetMemoryRefresh = now + TARGET_REFRESH_INTERVAL
 	end
-	previousTargetPosition = currentPosition
 
 	if canSeeTarget then
 		lastKnownPosition = currentPosition
-		lastSeenVelocity = flatten(targetRoot.AssemblyLinearVelocity)
+		lastSeenVelocity = currentVelocity
 		lastSeenAt = now
 	elseif not lastKnownPosition then
 		-- Initial no-LOS awareness is intentionally vague, like hearing movement nearby.
@@ -492,7 +512,13 @@ RunService.Heartbeat:Connect(function(deltaTime)
 	local now = os.clock()
 
 	if now >= nextTargetRefresh or not isTargetValid(targetRoot) then
-		targetRoot = chooseTarget()
+		local newTarget = chooseTarget()
+		if newTarget ~= targetRoot then
+			-- Wipe stale memory; otherwise the AI inherits the previous victim's
+			-- last-known position and velocity when switching targets.
+			resetTargetMemory()
+		end
+		targetRoot = newTarget
 		if not targetRoot then
 			setPlayerDetected(nil, false)
 		end
@@ -510,8 +536,12 @@ RunService.Heartbeat:Connect(function(deltaTime)
 		hadLineOfSight = canSeeTarget
 	end
 
+	-- The stop command is issued exactly once on pause entry below. Re-issuing
+	-- humanoid:MoveTo every frame cancels the previous request, fires
+	-- MoveToFinished(reached=false) on a loop, and that handler sets
+	-- forceRepath=true continuously -- which thrashes the pathfinder the moment
+	-- the pause ends.
 	if now < pauseUntil then
-		humanoid:MoveTo(rootPart.Position)
 		return
 	end
 
@@ -520,6 +550,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
 		if isTargetValid(targetRoot) and math.random() < GLITCH_PAUSE_CHANCE then
 			pauseUntil = now + randomRange(GLITCH_PAUSE_MIN, GLITCH_PAUSE_MAX)
 			clearPath()
+			humanoid:MoveTo(rootPart.Position)
 			return
 		end
 	end
@@ -560,13 +591,19 @@ RunService.Heartbeat:Connect(function(deltaTime)
 			and decisionDestination
 			and (rootPart.Position - decisionDestination).Magnitude > WAYPOINT_REACHED_DISTANCE
 		then
-			forceRepath = true
 			clearPath()
-			-- FIX: Nudge from current position rather than corrupting decisionDestination.
-			-- Mutating decisionDestination caused the NPC to wander away from the
-			-- target permanently after getting stuck.
+			forceRepath = true
+			-- Route the nudge through decisionDestination instead of issuing it
+			-- directly with commandMove. The unconditional `setDestination` block
+			-- below would otherwise re-path to the player and clobber the nudge
+			-- the same frame. Briefly gate the decision/search/idle updaters so
+			-- the next iteration doesn't immediately overwrite it either.
 			local nudge = rootPart.Position + randomHorizontalOffset(CONFIG.badPathOffset)
-			commandMove(nudge)
+			decisionDestination = nudge
+			local nudgeUntil = now + 0.5
+			committedUntil = math.max(committedUntil, nudgeUntil)
+			nextDecisionAt = math.max(nextDecisionAt, nudgeUntil)
+			nextIdleWanderAt = math.max(nextIdleWanderAt, nudgeUntil)
 			humanoid:ChangeState(Enum.HumanoidStateType.Running)
 		end
 		lastStuckPosition = rootPart.Position
