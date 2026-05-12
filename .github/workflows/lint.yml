@@ -27,7 +27,7 @@ jobs:
           sudo mv selene /usr/local/bin/
 
       - name: StyLua check
-        run: stylua --check plugin/
+        run: stylua --check plugin/ scripts/
 
       - name: Selene
-        run: selene plugin/
+        run: selene plugin/ scripts/
