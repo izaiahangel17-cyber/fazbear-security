@@ -1020,7 +1020,6 @@ local function setCameraView(cameraId: string)
 		local roomModel = part.Parent
 		local centre = part.Position
 		if roomModel and roomModel:IsA("Model") then
-			local _, _ = roomModel:GetBoundingBox()
 			local cf, _size = roomModel:GetBoundingBox()
 			centre = cf.Position
 		end
@@ -1078,7 +1077,7 @@ local function applyLockUI(state: { [string]: boolean })
 	for lockId, btn in pairs(doorButtons) do
 		local locked = state[lockId] == true
 		btn.BackgroundColor3 = locked and Color3.fromRGB(180, 40, 50) or Color3.fromRGB(40, 40, 40)
-		btn.Text = (locked and "[LOCKED]\n" or "[OPEN]\n") .. lockId
+		btn.Text = (locked and "[LOCKED]\n" or "[OPEN]\n") .. string.upper(lockId) .. " DOOR"
 	end
 end
 
